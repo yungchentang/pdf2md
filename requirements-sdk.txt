@@ -1,0 +1,6 @@
+glmocr[selfhosted]
+git+https://github.com/huggingface/transformers.git
+pillow
+pymupdf
+pypdf
+requests
