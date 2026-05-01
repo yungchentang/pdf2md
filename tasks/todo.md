@@ -1,5 +1,59 @@
 # pdf2md local OCR worker
 
+## 2026-05-01 - Single total progress bar
+
+### Plan
+- [x] Replace per-file progress bars with one total completed-files bar.
+- [x] Keep current worker/page text as activity status, not separate bars.
+- [x] Update heartbeat to show the same total bar plus active job details.
+- [x] Update tests for the new output shape.
+- [x] Run compile and unit tests.
+- [x] Document review results here.
+
+### Review
+- Removed per-file progress bars from job start messages.
+- New files now print `start <n>/<total>: <file>` as activity text.
+- The only progress bar now represents aggregate completed PDFs: `done=<n>, processed=<n>, failed=<n>`.
+- Heartbeats reuse the aggregate progress bar and append active worker/page details.
+- Verification passed: `.venv-sdk/bin/python -m compileall pdf2md.py pdf_to_markdown.py tests`; `.venv-sdk/bin/python -m unittest discover -s tests` ran 37 tests OK.
+
+## 2026-05-01 - Reduce progress noise and show model startup
+
+### Plan
+- [x] Remove duplicate normal-run `pending ...` output.
+- [x] Submit only active worker jobs instead of printing the entire queue as processing.
+- [x] Add visible model/server startup status and heartbeat while `mlx-vlm` loads.
+- [x] Keep dry-run useful by listing pending files there.
+- [x] Run compile and unit tests.
+- [x] Document review results here.
+
+### Review
+- Normal runs now print one scan summary instead of every `pending ...` and `skip ...` line.
+- Dry-runs still list pending/skipped files because there is no processing progress output in that mode.
+- Worker scheduling now starts only up to `--workers` active jobs. It no longer prints the whole queue as `processing`.
+- Server startup prints `starting mlx-vlm server ...`, `server: still starting ...`, and `server: mlx-vlm server ready ...` messages while the model loads.
+- Verification passed: `.venv-sdk/bin/python -m compileall pdf2md.py pdf_to_markdown.py tests`; `.venv-sdk/bin/python -m unittest discover -s tests` ran 36 tests OK.
+
+## 2026-05-01 - Live progress for workers
+
+### Plan
+- [x] Confirm why multi-file progress appears stuck.
+- [x] Add page-level progress callbacks from conversion workers.
+- [x] Let the main run loop print worker progress events while jobs are still running.
+- [x] Add heartbeat output while long OCR calls are active.
+- [x] Preserve final processed/failed accounting and status JSON.
+- [x] Add focused tests for progress callback behavior.
+- [x] Run compile and unit tests.
+- [x] Document review results here.
+
+### Review
+- Root cause: the worker implementation submitted all PDF futures, then blocked in `as_completed()`. Progress only moved when a whole PDF completed or failed.
+- Added `progress_callback` to `convert_pdf_job()` so workers emit `pages-ready`, `page-start`, and `page-done` events.
+- The main run loop now checks worker events every second and prints page-level progress while PDFs are still running.
+- Added a 30-second heartbeat for long OCR calls so the terminal shows active jobs even when a single page is taking a long time.
+- Status JSON now includes `active_pages` during processing.
+- Verification passed: `.venv-sdk/bin/python -m compileall pdf2md.py pdf_to_markdown.py tests`; `.venv-sdk/bin/python -m unittest discover -s tests` ran 35 tests OK.
+
 ## 2026-05-01 - Workers option for parallel PDFs
 
 ### Plan

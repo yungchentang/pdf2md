@@ -7,17 +7,18 @@ import argparse
 import json
 import os
 import plistlib
+import queue
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pdf_to_markdown import (
     DEFAULT_LOOKBACK_DAYS,
@@ -37,6 +38,7 @@ DEFAULT_LABEL = "com.kumi.pdf2md"
 DEFAULT_INTERVAL_SECONDS = 3600
 DEFAULT_PORT = 8080
 DEFAULT_SERVER_STARTUP_TIMEOUT_SECONDS = 900
+PROGRESS_HEARTBEAT_SECONDS = 30
 LAUNCHD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
@@ -171,6 +173,7 @@ class MlxServer(AbstractContextManager["MlxServer"]):
     stderr_fh: Any = None
     stdout_path: Path | None = None
     stderr_path: Path | None = None
+    status_callback: Callable[[str], None] | None = None
 
     def __enter__(self) -> "MlxServer":
         self.start()
@@ -217,6 +220,8 @@ class MlxServer(AbstractContextManager["MlxServer"]):
     def wait_until_ready(self) -> None:
         assert self.process is not None
         deadline = time.monotonic() + self.startup_timeout_seconds
+        started_at = time.monotonic()
+        next_heartbeat = started_at + PROGRESS_HEARTBEAT_SECONDS
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise Pdf2MdError(
@@ -225,7 +230,14 @@ class MlxServer(AbstractContextManager["MlxServer"]):
                 )
             request_timeout = min(30, max(1, int(deadline - time.monotonic())))
             if health_check(self.port, model=self.model, timeout_seconds=request_timeout):
+                if self.status_callback:
+                    self.status_callback(f"mlx-vlm server ready after {int(time.monotonic() - started_at)}s")
                 return
+            if self.status_callback and time.monotonic() >= next_heartbeat:
+                elapsed = int(time.monotonic() - started_at)
+                remaining = max(0, int(deadline - time.monotonic()))
+                self.status_callback(f"still starting mlx-vlm server; elapsed={elapsed}s, remaining_timeout={remaining}s")
+                next_heartbeat = time.monotonic() + PROGRESS_HEARTBEAT_SECONDS
             time.sleep(2)
         raise Pdf2MdError(
             f"mlx-vlm server did not become healthy within {self.startup_timeout_seconds} seconds\n"
@@ -315,13 +327,32 @@ def format_progress(index: int, total: int, label: str, *, width: int = 24) -> s
     return f"progress [{bar}] {done}/{total} ({percent:3d}%) {label}"
 
 
+def format_total_progress(completed: int, total: int, stats: dict[str, int]) -> str:
+    label = f"done={completed}, processed={stats.get('processed', 0)}, failed={stats.get('failed', 0)}"
+    return format_progress(completed, total, label)
+
+
 def process_job(
     *,
     index: int,
     job: Any,
     args: argparse.Namespace,
     work_root: Path,
+    progress_events: queue.Queue[dict[str, Any]] | None = None,
 ) -> JobOutcome:
+    def emit(stage: str, page: int, total_pages: int) -> None:
+        if progress_events is None:
+            return
+        progress_events.put(
+            {
+                "index": index,
+                "file": str(job.relative_path),
+                "stage": stage,
+                "page": page,
+                "total_pages": total_pages,
+            }
+        )
+
     try:
         file_deadline = None if args.no_timeout else time.monotonic() + args.timeout_seconds
         result = convert_pdf_job(
@@ -334,10 +365,32 @@ def process_job(
             timeout_seconds=None if args.no_timeout else args.timeout_seconds,
             deadline=file_deadline,
             include_header=args.include_header,
+            progress_callback=emit,
         )
         return JobOutcome(index=index, relative_path=str(job.relative_path), output_path=str(result.output_path))
     except Exception as exc:
         return JobOutcome(index=index, relative_path=str(job.relative_path), error=str(exc))
+
+
+def drain_progress_events(progress_events: queue.Queue[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    while True:
+        try:
+            events.append(progress_events.get_nowait())
+        except queue.Empty:
+            return events
+
+
+def format_page_progress(event: dict[str, Any]) -> str:
+    file = event.get("file", "(unknown)")
+    stage = event.get("stage", "progress")
+    page = int(event.get("page", 0))
+    total_pages = int(event.get("total_pages", 0))
+    if stage == "pages-ready":
+        return f"worker {event.get('index')}: {file} has {total_pages} pages"
+    if total_pages > 0 and page > 0:
+        return f"worker {event.get('index')}: {file} {stage} page {page}/{total_pages}"
+    return f"worker {event.get('index')}: {file} {stage}"
 
 
 def run_once(args: argparse.Namespace) -> int:
@@ -359,13 +412,13 @@ def run_once(args: argparse.Namespace) -> int:
             "source": str(source),
             "target": str(target),
             "all": all_files,
-                "date": args.date,
-                "lookback_days": args.lookback_days,
-                "timeout_seconds": None if args.no_timeout else args.timeout_seconds,
-                "workers": args.workers,
-                "stats": stats,
-            },
-        )
+            "date": args.date,
+            "lookback_days": args.lookback_days,
+            "timeout_seconds": None if args.no_timeout else args.timeout_seconds,
+            "workers": args.workers,
+            "stats": stats,
+        },
+    )
     try:
         jobs = discover_pdf_jobs(
             source,
@@ -379,10 +432,17 @@ def run_once(args: argparse.Namespace) -> int:
         for job in jobs:
             if not args.force and markdown_completed(job.target_path, allow_plain=not args.include_header):
                 stats["skipped"] += 1
-                print(f"skip {job.relative_path}: already completed")
+                if args.dry_run:
+                    print(f"skip {job.relative_path}: already completed")
                 continue
             pending.append(job)
-            print(f"pending {job.relative_path}")
+            if args.dry_run:
+                print(f"pending {job.relative_path}")
+        print(
+            "scan: "
+            f"discovered={stats['discovered']}, skipped={stats['skipped']}, "
+            f"pending={len(pending)}, workers={args.workers}"
+        )
 
         write_status(
             status_file,
@@ -416,49 +476,95 @@ def run_once(args: argparse.Namespace) -> int:
                 "stats": stats,
             },
         )
+        print(f"starting mlx-vlm server on port {args.port}; model={args.model}")
         with MlxServer(
             port=args.port,
             model=args.model,
             startup_timeout_seconds=args.server_startup_timeout_seconds,
             log_dir=root / "logs",
+            status_callback=lambda message: print(f"server: {message}"),
         ) as server:
             completed_count = 0
+            progress_events: queue.Queue[dict[str, Any]] = queue.Queue()
+            active_pages: dict[str, dict[str, Any]] = {}
+            last_heartbeat = time.monotonic()
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
-                futures = []
-                for index, job in enumerate(pending, start=1):
-                    print(format_progress(completed_count, len(pending), f"processing {job.relative_path}"))
-                    futures.append(executor.submit(process_job, index=index, job=job, args=args, work_root=work_root))
+                futures: set[Future[JobOutcome]] = set()
+                next_job_index = 0
 
-                for future in as_completed(futures):
-                    outcome = future.result()
-                    completed_count += 1
-                    if outcome.error is None:
-                        stats["processed"] += 1
-                        assert outcome.output_path is not None
-                        outputs.append(outcome.output_path)
-                        print(format_progress(completed_count, len(pending), f"processed {outcome.relative_path}"))
-                        print(f"processed {outcome.relative_path}: {outcome.output_path}")
-                    else:
-                        stats["failed"] += 1
-                        failures.append({"file": outcome.relative_path, "error": outcome.error})
-                        print(format_progress(completed_count, len(pending), f"failed {outcome.relative_path}"))
-                        print(f"failed {outcome.relative_path}: {outcome.error}", file=sys.stderr)
-                    active = max(0, len(pending) - completed_count)
-                    write_status(
-                        status_file,
-                        {
-                            "state": "running",
-                            "phase": "processing",
-                            "source": str(source),
-                            "target": str(target),
-                            "completed_count": completed_count,
-                            "active_jobs": active,
-                            "total_to_process": len(pending),
-                            "server_pid": server.pid,
-                            "workers": args.workers,
-                            "stats": stats,
-                        },
+                def submit_next() -> None:
+                    nonlocal next_job_index
+                    if next_job_index >= len(pending):
+                        return
+                    job = pending[next_job_index]
+                    index = next_job_index + 1
+                    next_job_index += 1
+                    print(f"start {index}/{len(pending)}: {job.relative_path}")
+                    futures.add(
+                        executor.submit(
+                            process_job,
+                            index=index,
+                            job=job,
+                            args=args,
+                            work_root=work_root,
+                            progress_events=progress_events,
+                        )
                     )
+
+                for _ in range(min(args.workers, len(pending))):
+                    submit_next()
+
+                while futures:
+                    done, futures = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
+                    for event in drain_progress_events(progress_events):
+                        print(format_page_progress(event))
+                        if event.get("stage") in {"page-start", "page-done", "pages-ready"}:
+                            active_pages[str(event.get("file"))] = event
+
+                    now = time.monotonic()
+                    if not done and now - last_heartbeat >= PROGRESS_HEARTBEAT_SECONDS:
+                        active = ", ".join(
+                            f"{Path(file).name}: page {event.get('page')}/{event.get('total_pages')}"
+                            for file, event in sorted(active_pages.items())
+                            if int(event.get("total_pages", 0)) > 0
+                        )
+                        suffix = f" active: {active}" if active else " waiting for OCR"
+                        print(format_total_progress(completed_count, len(pending), stats) + f"; running={len(futures)};{suffix}")
+                        last_heartbeat = now
+
+                    for future in done:
+                        outcome = future.result()
+                        completed_count += 1
+                        active_pages.pop(outcome.relative_path, None)
+                        if outcome.error is None:
+                            stats["processed"] += 1
+                            assert outcome.output_path is not None
+                            outputs.append(outcome.output_path)
+                            print(format_total_progress(completed_count, len(pending), stats))
+                            print(f"processed {outcome.relative_path}: {outcome.output_path}")
+                        else:
+                            stats["failed"] += 1
+                            failures.append({"file": outcome.relative_path, "error": outcome.error})
+                            print(format_total_progress(completed_count, len(pending), stats))
+                            print(f"failed {outcome.relative_path}: {outcome.error}", file=sys.stderr)
+                        submit_next()
+                        active = max(0, len(futures))
+                        write_status(
+                            status_file,
+                            {
+                                "state": "running",
+                                "phase": "processing",
+                                "source": str(source),
+                                "target": str(target),
+                                "completed_count": completed_count,
+                                "active_jobs": active,
+                                "active_pages": active_pages,
+                                "total_to_process": len(pending),
+                                "server_pid": server.pid,
+                                "workers": args.workers,
+                                "stats": stats,
+                            },
+                        )
 
         print("summary: " + ", ".join(f"{key}={value}" for key, value in stats.items()))
         write_status(

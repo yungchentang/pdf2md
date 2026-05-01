@@ -351,6 +351,42 @@ class OcrFallbackTest(unittest.TestCase):
             self.assertIn("<!-- page 1 -->", output)
             self.assertIn("Body text from OCR.", output)
 
+    def test_convert_reports_page_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "sample.pdf"
+            target = root / "sample.md"
+            first = root / "page-1.png"
+            second = root / "page-2.png"
+            source.write_bytes(b"%PDF")
+            first.write_bytes(b"fake image")
+            second.write_bytes(b"fake image")
+            job = PdfJob(source_path=source, target_path=target, relative_path=Path("sample.md"))
+            events = []
+            original_prepare = pdf_to_markdown.prepare_page_images
+            pdf_to_markdown.prepare_page_images = lambda *args, **kwargs: ([first, second], WatermarkSummary(enabled=False))
+
+            try:
+                convert_pdf_job(
+                    job,
+                    work_root=root / "work",
+                    ocr_runner=lambda *args, **kwargs: "This page contains enough OCR text.",
+                    progress_callback=lambda stage, page, total: events.append((stage, page, total)),
+                )
+            finally:
+                pdf_to_markdown.prepare_page_images = original_prepare
+
+            self.assertEqual(
+                events,
+                [
+                    ("pages-ready", 0, 2),
+                    ("page-start", 1, 2),
+                    ("page-done", 1, 2),
+                    ("page-start", 2, 2),
+                    ("page-done", 2, 2),
+                ],
+            )
+
 
 class LaunchAgentTest(unittest.TestCase):
     def test_plist_contains_timeout_and_lookback(self):
@@ -480,6 +516,20 @@ class CliTest(unittest.TestCase):
             "progress [#####-----] 2/4 ( 50%) processed sample.pdf",
         )
 
+    def test_format_total_progress_uses_aggregate_counts(self):
+        self.assertEqual(
+            pdf2md.format_total_progress(3, 5, {"processed": 2, "failed": 1}),
+            "progress [##############----------] 3/5 ( 60%) done=3, processed=2, failed=1",
+        )
+
+    def test_format_page_progress_shows_page_count(self):
+        self.assertEqual(
+            pdf2md.format_page_progress(
+                {"index": 2, "file": "sample.md", "stage": "page-done", "page": 3, "total_pages": 5}
+            ),
+            "worker 2: sample.md page-done page 3/5",
+        )
+
     def test_run_args_accept_workers(self):
         args = pdf2md.parse_args(
             [
@@ -542,6 +592,41 @@ class RunStatusTest(unittest.TestCase):
             self.assertEqual(status["state"], "finished")
             self.assertEqual(status["phase"], "dry-run-complete")
             self.assertEqual(status["stats"]["discovered"], 1)
+
+    def test_normal_run_suppresses_per_file_pending_and_skip_noise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            target = Path(tmp) / "target"
+            status_file = Path(tmp) / "status.json"
+            source.mkdir()
+            target.mkdir()
+            (source / "sample.pdf").write_bytes(b"%PDF")
+            (target / "sample.md").write_text(
+                "---\nstatus: completed\n---\n\nconverted content with enough meaningful OCR text\n",
+                encoding="utf-8",
+            )
+            args = pdf2md.parse_args(
+                [
+                    "run",
+                    "--source",
+                    str(source),
+                    "--target",
+                    str(target),
+                    "--all",
+                    "--status-file",
+                    str(status_file),
+                ]
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = pdf2md.run_once(args)
+
+            output = stdout.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("scan: discovered=1, skipped=1, pending=0, workers=1", output)
+            self.assertNotIn("pending sample.md", output)
+            self.assertNotIn("skip sample.md", output)
 
     def test_file_timeout_fails_one_job_and_continues_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,7 +701,7 @@ class RunStatusTest(unittest.TestCase):
             self.assertEqual(status["stats"]["processed"], 1)
             self.assertEqual(status["stats"]["failed"], 1)
             self.assertEqual(status["failures"][0]["file"], "a.md")
-            self.assertIn("progress [", stdout.getvalue())
+            self.assertIn("progress [############------------] 1/2 ( 50%) done=1, processed=0, failed=1", stdout.getvalue())
             self.assertIn("failed a.md: single file timed out", stderr.getvalue())
 
     def test_workers_two_dispatches_jobs_concurrently(self):

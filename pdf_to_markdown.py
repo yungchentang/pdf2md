@@ -834,6 +834,7 @@ def convert_pdf_job(
     deadline: float | None = None,
     ocr_runner: OcrRunner | None = None,
     include_header: bool = True,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> ConversionResult:
     ocr_runner = ocr_runner or (
         lambda image, config, output, timeout: run_glmocr_cli(
@@ -853,7 +854,12 @@ def convert_pdf_job(
     page_images, watermark = prepare_page_images(job.source_path, work_dir, preprocess_watermark=preprocess_watermark)
     page_markdowns: list[str] = []
     fallback_engines: list[str] = []
+    total_pages = len(page_images)
+    if progress_callback:
+        progress_callback("pages-ready", 0, total_pages)
     for index, image in enumerate(page_images, start=1):
+        if progress_callback:
+            progress_callback("page-start", index, total_pages)
         timeout_for_page = remaining_seconds(deadline)
         page_output_dir = work_dir / "ocr" / f"page-{index:04d}"
         markdown = normalize_ocr_markdown(ocr_runner(image, config_path, page_output_dir, timeout_for_page))
@@ -894,6 +900,8 @@ def convert_pdf_job(
             suffix = f" ({details})" if details else ""
             raise Pdf2MdError(f"OCR returned no meaningful content for {job.relative_path} page {index}{suffix}")
         page_markdowns.append(markdown)
+        if progress_callback:
+            progress_callback("page-done", index, total_pages)
 
     markdown = build_output_markdown(
         job,
