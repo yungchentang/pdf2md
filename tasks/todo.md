@@ -7,11 +7,16 @@
 - [x] Stage runnable project files: `.gitignore`, Python code, requirements, scripts, tests, and task/lesson records.
 - [x] Keep generated/local artifacts out of git: venvs, cache, logs, outputs, PDFs, and Python bytecode.
 - [x] Run verification before committing.
-- [ ] Commit and push the code to `origin/main`.
-- [ ] Verify GitHub tracking state and latest commit.
+- [x] Commit and push the code to `origin/main`.
+- [x] Verify GitHub tracking state and latest commit.
 
 ### Review
-- Pending.
+- Pushed commit `47f6770 Add runnable pdf2md worker` to `origin/main`.
+- Remote now contains the runnable project files: `.gitignore`, `pdf2md.py`, `pdf_to_markdown.py`, `requirements-mlx.txt`, `requirements-sdk.txt`, `scripts/vision_ocr.swift`, and `tests/test_pdf2md.py`.
+- Included `tasks/lessons.md` and `tasks/todo.md` so the correction and verification trail are preserved.
+- Verification passed before commit: `.venv-sdk/bin/python -m compileall pdf2md.py pdf_to_markdown.py tests`; `.venv-sdk/bin/python -m unittest discover -s tests` ran 25 tests OK.
+- Verified latest state after push: `47f6770 (HEAD -> main, origin/main) Add runnable pdf2md worker`.
+- Generated/local artifacts remain out of git via `.gitignore`: `.cache/`, `.venv*/`, `logs/`, `outputs/`, `codex_output/`, `pdfs/`, `__pycache__/`, and related test/cache outputs.
 
 ## 2026-05-01 - Initial GitHub push
 
