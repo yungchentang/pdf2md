@@ -1,5 +1,23 @@
 # pdf2md local OCR worker
 
+## 2026-05-01 - Default to no Markdown metadata header
+
+### Plan
+- [x] Confirm why metadata header still appears.
+- [x] Change run/schedule default to omit YAML frontmatter and generated title.
+- [x] Keep `--header` available for metadata/debug output.
+- [x] Update README and tests.
+- [x] Run compile and unit tests.
+- [x] Document review results here.
+
+### Review
+- The metadata block still appeared because `include_header` defaulted to true; `--no-header` was opt-in.
+- Changed CLI and LaunchAgent defaults so outputs omit YAML frontmatter and the generated title by default.
+- `--header` remains available when metadata/debug output is wanted.
+- Existing completed Markdown files are still skipped, so already generated files with headers require `--force` to regenerate without headers.
+- README now documents the new default and the `--force` requirement for old files.
+- Verification passed: `.venv-sdk/bin/python -m compileall pdf2md.py pdf_to_markdown.py tests`; `.venv-sdk/bin/python -m unittest discover -s tests` ran 39 tests OK.
+
 ## 2026-05-01 - Single total progress bar
 
 ### Plan

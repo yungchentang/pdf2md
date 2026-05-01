@@ -647,7 +647,7 @@ def build_launch_agent_plist(
     date: str | None = None,
     force: bool = False,
     preprocess_watermark: bool = True,
-    include_header: bool = True,
+    include_header: bool = False,
     workers: int = 1,
     port: int = DEFAULT_PORT,
     log_dir: Path | None = None,
@@ -681,8 +681,8 @@ def build_launch_agent_plist(
         args.append("--force")
     if not preprocess_watermark:
         args.append("--no-preprocess-watermark")
-    if not include_header:
-        args.append("--no-header")
+    if include_header:
+        args.append("--header")
     return {
         "Label": label,
         "ProgramArguments": args,
@@ -827,7 +827,7 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--force", action="store_true", help="Reprocess completed Markdown outputs.")
     parser.add_argument("--preprocess-watermark", dest="preprocess_watermark", action="store_true", default=True)
     parser.add_argument("--no-preprocess-watermark", dest="preprocess_watermark", action="store_false")
-    parser.add_argument("--header", dest="include_header", action="store_true", default=True)
+    parser.add_argument("--header", dest="include_header", action="store_true", default=False, help="Include YAML frontmatter and generated title in Markdown outputs.")
     parser.add_argument("--no-header", dest="include_header", action="store_false", help="Write only converted content without YAML frontmatter or title.")
     parser.add_argument("--workers", type=int, default=1, help="Number of PDF files to process concurrently.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)

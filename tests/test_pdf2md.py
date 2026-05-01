@@ -414,10 +414,20 @@ class LaunchAgentTest(unittest.TestCase):
             source=Path("/tmp/source"),
             target=Path("/tmp/target"),
             python_path=Path("/tmp/pdf2md/.venv-sdk/bin/python"),
-            include_header=False,
         )
 
-        self.assertIn("--no-header", plist["ProgramArguments"])
+        self.assertNotIn("--header", plist["ProgramArguments"])
+        self.assertNotIn("--no-header", plist["ProgramArguments"])
+
+    def test_plist_can_enable_output_header(self):
+        plist = pdf2md.build_launch_agent_plist(
+            source=Path("/tmp/source"),
+            target=Path("/tmp/target"),
+            python_path=Path("/tmp/pdf2md/.venv-sdk/bin/python"),
+            include_header=True,
+        )
+
+        self.assertIn("--header", plist["ProgramArguments"])
 
     def test_schedule_rejects_backfill_without_explicit_allow(self):
         args = argparse.Namespace(
@@ -544,6 +554,19 @@ class CliTest(unittest.TestCase):
         )
 
         self.assertEqual(args.workers, 2)
+
+    def test_run_args_default_to_no_header(self):
+        args = pdf2md.parse_args(
+            [
+                "run",
+                "--source",
+                "/tmp/source",
+                "--target",
+                "/tmp/target",
+            ]
+        )
+
+        self.assertFalse(args.include_header)
 
     def test_run_args_reject_non_positive_workers(self):
         args = pdf2md.parse_args(

@@ -162,34 +162,31 @@ Dry-run the current scan without starting OCR:
   --dry-run
 ```
 
-Completed Markdown files are skipped when their frontmatter contains:
-
-```yaml
-status: completed
-```
-
-The worker also checks that the Markdown body has real OCR content. A previous
-empty/placeholder file with `status: completed` is treated as incomplete and
-will be reprocessed. Use `--force` to regenerate existing completed outputs.
-
-To write only the converted page content, without YAML frontmatter or the
-generated `# filename` title, pass:
+By default, outputs contain only converted page content. Use `--header` only if
+you want YAML frontmatter and a generated `# filename` title for debugging:
 
 ```bash
 .venv-sdk/bin/python pdf2md.py run \
   --source /path/to/pdf-folder \
   --target /path/to/md-folder \
   --all \
-  --no-header
+  --header
 ```
 
-When `--no-header` is used, completed files are skipped if the existing Markdown
-has meaningful content.
+Completed Markdown files are skipped when they have meaningful content. Headered
+outputs are also skipped when their frontmatter contains:
+
+```yaml
+status: completed
+```
+
+Use `--force` to regenerate existing completed outputs. This is required if you
+want to remove headers from Markdown files that were already generated earlier.
 
 If the GLM-OCR SDK region pipeline returns empty Markdown for a page, the worker
 falls back to direct whole-page OCR against the same local `mlx-vlm` server. If
-that also returns empty content, it falls back to macOS Vision OCR and records
-the fallback in frontmatter:
+that also returns empty content, it falls back to macOS Vision OCR. With
+`--header`, the fallback is recorded in frontmatter:
 
 ```yaml
 fallback_ocr_engines: "macos_vision"
