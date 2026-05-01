@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,6 @@ from pdf_to_markdown import (
     convert_pdf_job,
     discover_pdf_jobs,
     markdown_completed,
-    remaining_seconds,
     write_status,
 )
 
@@ -264,6 +264,14 @@ class MlxServer(AbstractContextManager["MlxServer"]):
         self.process = None
 
 
+@dataclass(frozen=True)
+class JobOutcome:
+    index: int
+    relative_path: str
+    output_path: str | None = None
+    error: str | None = None
+
+
 def setup_environment(args: argparse.Namespace) -> int:
     root = project_root()
     mlx_venv = root / ".venv-mlx"
@@ -293,6 +301,43 @@ def validate_run_args(args: argparse.Namespace) -> None:
         raise SystemExit("--no-timeout is only allowed with --all or --lookback-days 0")
     if args.timeout_seconds <= 0 and not args.no_timeout:
         raise SystemExit("--timeout-seconds must be positive")
+    if args.workers <= 0:
+        raise SystemExit("--workers must be positive")
+
+
+def format_progress(index: int, total: int, label: str, *, width: int = 24) -> str:
+    if total <= 0:
+        return f"progress [{' ' * width}] 0/0 {label}"
+    done = max(0, min(index, total))
+    filled = int(width * done / total)
+    bar = "#" * filled + "-" * (width - filled)
+    percent = int(100 * done / total)
+    return f"progress [{bar}] {done}/{total} ({percent:3d}%) {label}"
+
+
+def process_job(
+    *,
+    index: int,
+    job: Any,
+    args: argparse.Namespace,
+    work_root: Path,
+) -> JobOutcome:
+    try:
+        file_deadline = None if args.no_timeout else time.monotonic() + args.timeout_seconds
+        result = convert_pdf_job(
+            job,
+            work_root=work_root,
+            config_path=None,
+            model=args.model,
+            api_port=args.port,
+            preprocess_watermark=args.preprocess_watermark,
+            timeout_seconds=None if args.no_timeout else args.timeout_seconds,
+            deadline=file_deadline,
+            include_header=args.include_header,
+        )
+        return JobOutcome(index=index, relative_path=str(job.relative_path), output_path=str(result.output_path))
+    except Exception as exc:
+        return JobOutcome(index=index, relative_path=str(job.relative_path), error=str(exc))
 
 
 def run_once(args: argparse.Namespace) -> int:
@@ -302,7 +347,6 @@ def run_once(args: argparse.Namespace) -> int:
     target = Path(args.target).expanduser().resolve()
     status_file = Path(args.status_file).expanduser().resolve() if args.status_file else None
     all_files = bool(args.all or args.lookback_days == 0)
-    deadline = None if args.no_timeout else time.monotonic() + args.timeout_seconds
     stats = {"discovered": 0, "skipped": 0, "processed": 0, "failed": 0}
     outputs: list[str] = []
     failures: list[dict[str, str]] = []
@@ -315,12 +359,13 @@ def run_once(args: argparse.Namespace) -> int:
             "source": str(source),
             "target": str(target),
             "all": all_files,
-            "date": args.date,
-            "lookback_days": args.lookback_days,
-            "timeout_seconds": None if args.no_timeout else args.timeout_seconds,
-            "stats": stats,
-        },
-    )
+                "date": args.date,
+                "lookback_days": args.lookback_days,
+                "timeout_seconds": None if args.no_timeout else args.timeout_seconds,
+                "workers": args.workers,
+                "stats": stats,
+            },
+        )
     try:
         jobs = discover_pdf_jobs(
             source,
@@ -332,7 +377,7 @@ def run_once(args: argparse.Namespace) -> int:
         stats["discovered"] = len(jobs)
         pending = []
         for job in jobs:
-            if not args.force and markdown_completed(job.target_path):
+            if not args.force and markdown_completed(job.target_path, allow_plain=not args.include_header):
                 stats["skipped"] += 1
                 print(f"skip {job.relative_path}: already completed")
                 continue
@@ -349,6 +394,7 @@ def run_once(args: argparse.Namespace) -> int:
                 "total_to_process": len(pending),
                 "pending_files": [str(job.relative_path) for job in pending],
                 "server_pid": None,
+                "workers": args.workers,
                 "stats": stats,
             },
         )
@@ -366,51 +412,53 @@ def run_once(args: argparse.Namespace) -> int:
                 "source": str(source),
                 "target": str(target),
                 "total_to_process": len(pending),
+                "workers": args.workers,
                 "stats": stats,
             },
         )
         with MlxServer(
             port=args.port,
             model=args.model,
-            startup_timeout_seconds=min(args.server_startup_timeout_seconds, remaining_seconds(deadline) or args.server_startup_timeout_seconds),
+            startup_timeout_seconds=args.server_startup_timeout_seconds,
             log_dir=root / "logs",
         ) as server:
-            for index, job in enumerate(pending, start=1):
-                remaining_seconds(deadline)
-                write_status(
-                    status_file,
-                    {
-                        "state": "running",
-                        "phase": "processing",
-                        "source": str(source),
-                        "target": str(target),
-                        "current_index": index,
-                        "total_to_process": len(pending),
-                        "current_file": str(job.relative_path),
-                        "server_pid": server.pid,
-                        "stats": stats,
-                    },
-                )
-                try:
-                    result = convert_pdf_job(
-                        job,
-                        work_root=work_root,
-                        config_path=None,
-                        model=args.model,
-                        api_port=args.port,
-                        preprocess_watermark=args.preprocess_watermark,
-                        timeout_seconds=None if args.no_timeout else args.timeout_seconds,
-                        deadline=deadline,
+            completed_count = 0
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = []
+                for index, job in enumerate(pending, start=1):
+                    print(format_progress(completed_count, len(pending), f"processing {job.relative_path}"))
+                    futures.append(executor.submit(process_job, index=index, job=job, args=args, work_root=work_root))
+
+                for future in as_completed(futures):
+                    outcome = future.result()
+                    completed_count += 1
+                    if outcome.error is None:
+                        stats["processed"] += 1
+                        assert outcome.output_path is not None
+                        outputs.append(outcome.output_path)
+                        print(format_progress(completed_count, len(pending), f"processed {outcome.relative_path}"))
+                        print(f"processed {outcome.relative_path}: {outcome.output_path}")
+                    else:
+                        stats["failed"] += 1
+                        failures.append({"file": outcome.relative_path, "error": outcome.error})
+                        print(format_progress(completed_count, len(pending), f"failed {outcome.relative_path}"))
+                        print(f"failed {outcome.relative_path}: {outcome.error}", file=sys.stderr)
+                    active = max(0, len(pending) - completed_count)
+                    write_status(
+                        status_file,
+                        {
+                            "state": "running",
+                            "phase": "processing",
+                            "source": str(source),
+                            "target": str(target),
+                            "completed_count": completed_count,
+                            "active_jobs": active,
+                            "total_to_process": len(pending),
+                            "server_pid": server.pid,
+                            "workers": args.workers,
+                            "stats": stats,
+                        },
                     )
-                    stats["processed"] += 1
-                    outputs.append(str(result.output_path))
-                    print(f"processed {job.relative_path}: {result.output_path}")
-                except ConversionTimeout:
-                    raise
-                except Exception as exc:
-                    stats["failed"] += 1
-                    failures.append({"file": str(job.relative_path), "error": str(exc)})
-                    print(f"failed {job.relative_path}: {exc}", file=sys.stderr)
 
         print("summary: " + ", ".join(f"{key}={value}" for key, value in stats.items()))
         write_status(
@@ -421,6 +469,7 @@ def run_once(args: argparse.Namespace) -> int:
                 "source": str(source),
                 "target": str(target),
                 "server_pid": None,
+                "workers": args.workers,
                 "stats": stats,
                 "outputs": outputs,
                 "failures": failures,
@@ -439,6 +488,7 @@ def run_once(args: argparse.Namespace) -> int:
                 "target": str(target),
                 "server_pid": None,
                 "timeout_seconds": None if args.no_timeout else args.timeout_seconds,
+                "workers": args.workers,
                 "error_message": str(exc),
                 "stats": stats,
             },
@@ -453,6 +503,7 @@ def run_once(args: argparse.Namespace) -> int:
                 "source": str(source),
                 "target": str(target),
                 "server_pid": None,
+                "workers": args.workers,
                 "stats": stats,
             },
         )
@@ -468,6 +519,7 @@ def run_once(args: argparse.Namespace) -> int:
                 "source": str(source),
                 "target": str(target),
                 "server_pid": None,
+                "workers": args.workers,
                 "error_message": str(exc),
                 "stats": stats,
             },
@@ -489,6 +541,8 @@ def build_launch_agent_plist(
     date: str | None = None,
     force: bool = False,
     preprocess_watermark: bool = True,
+    include_header: bool = True,
+    workers: int = 1,
     port: int = DEFAULT_PORT,
     log_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -508,6 +562,8 @@ def build_launch_agent_plist(
         str(root / DEFAULT_STATUS_FILE),
         "--port",
         str(port),
+        "--workers",
+        str(workers),
     ]
     if all_files:
         args.append("--all")
@@ -519,6 +575,8 @@ def build_launch_agent_plist(
         args.append("--force")
     if not preprocess_watermark:
         args.append("--no-preprocess-watermark")
+    if not include_header:
+        args.append("--no-header")
     return {
         "Label": label,
         "ProgramArguments": args,
@@ -565,6 +623,8 @@ def install_schedule(args: argparse.Namespace) -> int:
         date=args.date,
         force=args.force,
         preprocess_watermark=args.preprocess_watermark,
+        include_header=args.include_header,
+        workers=args.workers,
         port=args.port,
         log_dir=Path(args.log_dir).expanduser().resolve() if args.log_dir else None,
     )
@@ -661,6 +721,9 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--force", action="store_true", help="Reprocess completed Markdown outputs.")
     parser.add_argument("--preprocess-watermark", dest="preprocess_watermark", action="store_true", default=True)
     parser.add_argument("--no-preprocess-watermark", dest="preprocess_watermark", action="store_false")
+    parser.add_argument("--header", dest="include_header", action="store_true", default=True)
+    parser.add_argument("--no-header", dest="include_header", action="store_false", help="Write only converted content without YAML frontmatter or title.")
+    parser.add_argument("--workers", type=int, default=1, help="Number of PDF files to process concurrently.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
 
 

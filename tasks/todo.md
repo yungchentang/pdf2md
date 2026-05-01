@@ -1,5 +1,66 @@
 # pdf2md local OCR worker
 
+## 2026-05-01 - Workers option for parallel PDFs
+
+### Plan
+- [x] Confirm `--workers` is not currently supported.
+- [x] Add `--workers` CLI validation with default `1`.
+- [x] Process multiple pending PDFs concurrently when `--workers > 1`, while keeping one shared MLX server.
+- [x] Keep per-file timeout, failure collection, no-header, and progress output working under parallel execution.
+- [x] Pass `--workers` through scheduled LaunchAgent generation.
+- [x] Add focused tests for parsing, validation, scheduling, and parallel dispatch.
+- [x] Run compile and unit tests.
+- [x] Document review results here.
+
+### Review
+- `--workers` did not exist before this change.
+- Added `--workers` to run/scheduled arguments with default `1` and validation that it must be positive.
+- `run_once()` now uses a `ThreadPoolExecutor` for pending PDF jobs. Each job keeps its own per-file timeout deadline and writes to its own work directory.
+- The implementation intentionally keeps one shared `mlx-vlm` server on the configured port to avoid loading multiple model copies by default.
+- Final status JSON records `workers`, and in-progress status records completed/active counts.
+- LaunchAgent generation passes `--workers <n>` through.
+- README documents `--workers 2` and warns that higher values can increase memory pressure.
+- Verification passed: `.venv-sdk/bin/python -m compileall pdf2md.py pdf_to_markdown.py tests`; `.venv-sdk/bin/python -m unittest discover -s tests` ran 33 tests OK.
+
+## 2026-05-01 - Optional Markdown header
+
+### Plan
+- [x] Confirm where output Markdown header is generated.
+- [x] Add a CLI option to disable frontmatter and title header for converted files.
+- [x] Preserve skip behavior for no-header outputs so completed files are not reprocessed every run.
+- [x] Pass the option through scheduled runs.
+- [x] Add focused tests and update README.
+- [x] Run compile and unit tests.
+- [x] Document review results here.
+
+### Review
+- The generated header came from `build_output_markdown()`: YAML frontmatter plus a `# <filename>` title.
+- Added `--no-header` / `--header` to shared run arguments. Default behavior stays unchanged.
+- `--no-header` writes only page markers and OCR body content, without frontmatter or title.
+- Updated skip logic so no-header outputs with meaningful Markdown content are skipped on later no-header runs.
+- Scheduled runs can pass through `--no-header`; LaunchAgent generation includes it when selected.
+- Updated README with the no-header command example.
+- Verification passed: `.venv-sdk/bin/python -m compileall pdf2md.py pdf_to_markdown.py tests`; `.venv-sdk/bin/python -m unittest discover -s tests` ran 30 tests OK.
+
+## 2026-05-01 - Per-file timeout and progress
+
+### Plan
+- [x] Confirm current timeout behavior and progress/status output.
+- [x] Change `run --timeout-seconds` from a whole-run budget to a per-file budget so each new PDF gets a fresh timer.
+- [x] Keep single-file timeout as a failed file and continue the batch instead of aborting the run.
+- [x] Add visible per-file progress output while preserving existing status-file fields.
+- [x] Add focused tests for per-file timeout continuation and progress formatting.
+- [x] Run compile and unit tests.
+- [x] Document review results here.
+
+### Review
+- Root cause: `run_once()` created one run-level deadline before processing and passed that same deadline into every PDF conversion. A `ConversionTimeout` also escaped the per-file loop and ended the whole batch with exit code 124.
+- Changed `run --timeout-seconds` to mean per-file timeout: each pending PDF now gets a fresh `file_deadline`, and a timeout records that PDF as failed before continuing to the next file.
+- Added console progress lines such as `progress [######------------------] 1/4 ( 25%) processed file.md` for processing, processed, and failed states.
+- Kept the existing status-file flow and final `done-with-failures` behavior for batches where some files fail.
+- Updated README to document per-file timeout semantics for manual backfills and scheduled runs.
+- Verification passed: `.venv-sdk/bin/python -m compileall pdf2md.py pdf_to_markdown.py tests`; `.venv-sdk/bin/python -m unittest discover -s tests` ran 27 tests OK.
+
 ## 2026-05-01 - Correction: push runnable code
 
 ### Plan

@@ -72,8 +72,10 @@ Run the first full conversion manually:
   --timeout-seconds 21600
 ```
 
-Use `--no-timeout` only for a manual full backfill when you are watching the
-machine:
+`--timeout-seconds` is a per-file budget. If one PDF times out, that file is
+marked failed and the next PDF starts with a fresh timer, so overnight backfills
+can continue through a bad or unusually slow file. Use `--no-timeout` only for a
+manual full backfill when you are watching the machine:
 
 ```bash
 .venv-sdk/bin/python pdf2md.py run \
@@ -86,7 +88,7 @@ machine:
 ## Recurring Runs
 
 Recurring automation should scan only recent date folders and always use a
-timeout:
+per-file timeout:
 
 ```bash
 .venv-sdk/bin/python pdf2md.py install-schedule \
@@ -136,6 +138,20 @@ Scan one date:
   --date 2026-04-28
 ```
 
+Process two PDFs concurrently:
+
+```bash
+.venv-sdk/bin/python pdf2md.py run \
+  --source /path/to/pdf-folder \
+  --target /path/to/md-folder \
+  --all \
+  --workers 2
+```
+
+`--workers` controls concurrent PDF jobs. The default is `1`. Start with
+`--workers 2` on Apple Silicon; higher values can increase memory pressure and
+may not help if the local MLX server is already the bottleneck.
+
 Dry-run the current scan without starting OCR:
 
 ```bash
@@ -155,6 +171,20 @@ status: completed
 The worker also checks that the Markdown body has real OCR content. A previous
 empty/placeholder file with `status: completed` is treated as incomplete and
 will be reprocessed. Use `--force` to regenerate existing completed outputs.
+
+To write only the converted page content, without YAML frontmatter or the
+generated `# filename` title, pass:
+
+```bash
+.venv-sdk/bin/python pdf2md.py run \
+  --source /path/to/pdf-folder \
+  --target /path/to/md-folder \
+  --all \
+  --no-header
+```
+
+When `--no-header` is used, completed files are skipped if the existing Markdown
+has meaningful content.
 
 If the GLM-OCR SDK region pipeline returns empty Markdown for a page, the worker
 falls back to direct whole-page OCR against the same local `mlx-vlm` server. If

@@ -165,15 +165,15 @@ def read_text(path: Path, max_bytes: int = 200_000) -> str:
         return fh.read(max_bytes).decode("utf-8", errors="replace")
 
 
-def markdown_completed(path: Path) -> bool:
+def markdown_completed(path: Path, *, allow_plain: bool = False) -> bool:
     if not path.exists() or not path.is_file():
         return False
     text = read_text(path, max_bytes=20_000)
     if not text.startswith("---\n"):
-        return False
+        return allow_plain and markdown_has_meaningful_content(text)
     end = text.find("\n---", 4)
     if end == -1:
-        return False
+        return allow_plain and markdown_has_meaningful_content(text)
     frontmatter = text[4:end]
     return bool(re.search(r"(?m)^status:\s*[\"']?completed[\"']?\s*$", frontmatter)) and markdown_has_meaningful_content(text)
 
@@ -791,6 +791,7 @@ def build_output_markdown(
     watermark: WatermarkSummary,
     timeout_seconds: int | None,
     fallback_engines: tuple[str, ...] = (),
+    include_header: bool = True,
 ) -> str:
     fields = {
         "schema_version": "1.0",
@@ -816,6 +817,8 @@ def build_output_markdown(
     ).strip()
     if not body:
         body = "_No OCR content returned._"
+    if not include_header:
+        return f"{body}\n"
     return f"---\n{frontmatter}\n---\n\n# {title}\n\n{body}\n"
 
 
@@ -830,6 +833,7 @@ def convert_pdf_job(
     timeout_seconds: int | None = DEFAULT_TIMEOUT_SECONDS,
     deadline: float | None = None,
     ocr_runner: OcrRunner | None = None,
+    include_header: bool = True,
 ) -> ConversionResult:
     ocr_runner = ocr_runner or (
         lambda image, config, output, timeout: run_glmocr_cli(
@@ -899,6 +903,7 @@ def convert_pdf_job(
         watermark=watermark,
         timeout_seconds=timeout_seconds,
         fallback_engines=tuple(dict.fromkeys(fallback_engines)),
+        include_header=include_header,
     )
     atomic_write_text(job.target_path, markdown)
     return ConversionResult(

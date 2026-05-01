@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import date as Date
@@ -121,6 +122,14 @@ class CompletionTest(unittest.TestCase):
 
     def test_normalize_ocr_markdown_unwraps_code_fence(self):
         self.assertEqual(normalize_ocr_markdown("```markdown\nhello\n```"), "hello")
+
+    def test_plain_markdown_can_be_skipped_when_header_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.md"
+            path.write_text("Converted OCR content without generated frontmatter.\n", encoding="utf-8")
+
+            self.assertFalse(markdown_completed(path))
+            self.assertTrue(markdown_completed(path, allow_plain=True))
 
 
 class GlmOcrExecutableTest(unittest.TestCase):
@@ -318,6 +327,30 @@ class OcrFallbackTest(unittest.TestCase):
             self.assertIn('fallback_ocr_engines: "macos_vision"', output)
             self.assertIn("macOS Vision OCR fallback", output)
 
+    def test_build_output_markdown_can_omit_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job = PdfJob(
+                source_path=root / "sample.pdf",
+                target_path=root / "sample.md",
+                relative_path=Path("sample.md"),
+            )
+
+            output = pdf_to_markdown.build_output_markdown(
+                job,
+                page_markdowns=["Body text from OCR."],
+                page_count=1,
+                model="test-model",
+                watermark=WatermarkSummary(enabled=False),
+                timeout_seconds=10,
+                include_header=False,
+            )
+
+            self.assertFalse(output.startswith("---\n"))
+            self.assertNotIn("# sample", output)
+            self.assertIn("<!-- page 1 -->", output)
+            self.assertIn("Body text from OCR.", output)
+
 
 class LaunchAgentTest(unittest.TestCase):
     def test_plist_contains_timeout_and_lookback(self):
@@ -327,6 +360,7 @@ class LaunchAgentTest(unittest.TestCase):
             python_path=Path("/tmp/pdf2md/.venv-sdk/bin/python"),
             timeout_seconds=123,
             lookback_days=5,
+            workers=2,
         )
 
         args = plist["ProgramArguments"]
@@ -334,8 +368,20 @@ class LaunchAgentTest(unittest.TestCase):
         self.assertIn("123", args)
         self.assertIn("--lookback-days", args)
         self.assertIn("5", args)
+        self.assertIn("--workers", args)
+        self.assertIn("2", args)
         self.assertNotIn("--all", args)
         self.assertEqual(plist["StartInterval"], pdf2md.DEFAULT_INTERVAL_SECONDS)
+
+    def test_plist_can_disable_output_header(self):
+        plist = pdf2md.build_launch_agent_plist(
+            source=Path("/tmp/source"),
+            target=Path("/tmp/target"),
+            python_path=Path("/tmp/pdf2md/.venv-sdk/bin/python"),
+            include_header=False,
+        )
+
+        self.assertIn("--no-header", plist["ProgramArguments"])
 
     def test_schedule_rejects_backfill_without_explicit_allow(self):
         args = argparse.Namespace(
@@ -428,6 +474,43 @@ class CliTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             pdf2md.validate_run_args(args)
 
+    def test_format_progress_shows_count_percent_and_label(self):
+        self.assertEqual(
+            pdf2md.format_progress(2, 4, "processed sample.pdf", width=10),
+            "progress [#####-----] 2/4 ( 50%) processed sample.pdf",
+        )
+
+    def test_run_args_accept_workers(self):
+        args = pdf2md.parse_args(
+            [
+                "run",
+                "--source",
+                "/tmp/source",
+                "--target",
+                "/tmp/target",
+                "--workers",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.workers, 2)
+
+    def test_run_args_reject_non_positive_workers(self):
+        args = pdf2md.parse_args(
+            [
+                "run",
+                "--source",
+                "/tmp/source",
+                "--target",
+                "/tmp/target",
+                "--workers",
+                "0",
+            ]
+        )
+
+        with self.assertRaises(SystemExit):
+            pdf2md.validate_run_args(args)
+
 
 class RunStatusTest(unittest.TestCase):
     def test_dry_run_writes_finished_status(self):
@@ -459,6 +542,156 @@ class RunStatusTest(unittest.TestCase):
             self.assertEqual(status["state"], "finished")
             self.assertEqual(status["phase"], "dry-run-complete")
             self.assertEqual(status["stats"]["discovered"], 1)
+
+    def test_file_timeout_fails_one_job_and_continues_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            target = Path(tmp) / "target"
+            status_file = Path(tmp) / "status.json"
+            source.mkdir()
+            (source / "a.pdf").write_bytes(b"%PDF")
+            (source / "b.pdf").write_bytes(b"%PDF")
+            args = pdf2md.parse_args(
+                [
+                    "run",
+                    "--source",
+                    str(source),
+                    "--target",
+                    str(target),
+                    "--all",
+                    "--timeout-seconds",
+                    "7",
+                    "--status-file",
+                    str(status_file),
+                ]
+            )
+
+            class FakeServer:
+                pid = 12345
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return None
+
+            calls = []
+
+            def fake_convert(job, **kwargs):
+                calls.append((str(job.relative_path), kwargs["timeout_seconds"], kwargs["deadline"]))
+                if job.relative_path.name == "a.md":
+                    raise ConversionTimeout("single file timed out")
+                job.target_path.parent.mkdir(parents=True, exist_ok=True)
+                job.target_path.write_text("---\nstatus: completed\n---\n\nconverted content\n", encoding="utf-8")
+                return pdf_to_markdown.ConversionResult(
+                    output_path=job.target_path,
+                    page_count=1,
+                    watermark=WatermarkSummary(enabled=False),
+                )
+
+            original_server = pdf2md.MlxServer
+            original_convert = pdf2md.convert_pdf_job
+            pdf2md.MlxServer = FakeServer
+            pdf2md.convert_pdf_job = fake_convert
+            try:
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    rc = pdf2md.run_once(args)
+            finally:
+                pdf2md.MlxServer = original_server
+                pdf2md.convert_pdf_job = original_convert
+
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(rc, 1)
+            self.assertEqual([call[0] for call in calls], ["a.md", "b.md"])
+            self.assertEqual([call[1] for call in calls], [7, 7])
+            self.assertIsNotNone(calls[0][2])
+            self.assertIsNotNone(calls[1][2])
+            self.assertEqual(status["phase"], "done-with-failures")
+            self.assertEqual(status["stats"]["processed"], 1)
+            self.assertEqual(status["stats"]["failed"], 1)
+            self.assertEqual(status["failures"][0]["file"], "a.md")
+            self.assertIn("progress [", stdout.getvalue())
+            self.assertIn("failed a.md: single file timed out", stderr.getvalue())
+
+    def test_workers_two_dispatches_jobs_concurrently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            target = Path(tmp) / "target"
+            status_file = Path(tmp) / "status.json"
+            source.mkdir()
+            (source / "a.pdf").write_bytes(b"%PDF")
+            (source / "b.pdf").write_bytes(b"%PDF")
+            args = pdf2md.parse_args(
+                [
+                    "run",
+                    "--source",
+                    str(source),
+                    "--target",
+                    str(target),
+                    "--all",
+                    "--workers",
+                    "2",
+                    "--status-file",
+                    str(status_file),
+                ]
+            )
+
+            class FakeServer:
+                pid = 12345
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return None
+
+            entered = []
+            both_entered = threading.Event()
+            release = threading.Event()
+            lock = threading.Lock()
+
+            def fake_convert(job, **kwargs):
+                with lock:
+                    entered.append(str(job.relative_path))
+                    if len(entered) == 2:
+                        both_entered.set()
+                self.assertTrue(both_entered.wait(timeout=2))
+                release.set()
+                job.target_path.parent.mkdir(parents=True, exist_ok=True)
+                job.target_path.write_text("---\nstatus: completed\n---\n\nconverted content\n", encoding="utf-8")
+                return pdf_to_markdown.ConversionResult(
+                    output_path=job.target_path,
+                    page_count=1,
+                    watermark=WatermarkSummary(enabled=False),
+                )
+
+            original_server = pdf2md.MlxServer
+            original_convert = pdf2md.convert_pdf_job
+            pdf2md.MlxServer = FakeServer
+            pdf2md.convert_pdf_job = fake_convert
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = pdf2md.run_once(args)
+            finally:
+                pdf2md.MlxServer = original_server
+                pdf2md.convert_pdf_job = original_convert
+
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(set(entered), {"a.md", "b.md"})
+            self.assertTrue(release.is_set())
+            self.assertEqual(status["stats"]["processed"], 2)
+            self.assertEqual(status["workers"], 2)
 
 
 if __name__ == "__main__":
